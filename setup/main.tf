@@ -2,7 +2,7 @@ provider "aws" {
   region = var.region
 }
 
-# 간단한 VPC 및 보안 그룹
+# VPC 리소스
 resource "aws_vpc" "atlantis_vpc" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
@@ -50,11 +50,13 @@ resource "aws_route_table_association" "atlantis_rta" {
   route_table_id = aws_route_table.atlantis_rt.id
 }
 
+# 보안 그룹 (Atlantis 및 Kubernetes 포트 추가)
 resource "aws_security_group" "atlantis_sg" {
   name        = "atlantis-sg"
   description = "Security group for Atlantis server"
   vpc_id      = aws_vpc.atlantis_vpc.id
 
+  # SSH
   ingress {
     from_port   = 22
     to_port     = 22
@@ -62,6 +64,7 @@ resource "aws_security_group" "atlantis_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # HTTP
   ingress {
     from_port   = 80
     to_port     = 80
@@ -69,6 +72,7 @@ resource "aws_security_group" "atlantis_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # HTTPS
   ingress {
     from_port   = 443
     to_port     = 443
@@ -76,6 +80,23 @@ resource "aws_security_group" "atlantis_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # Kubernetes API 서버
+  ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Kubernetes NodePort 범위
+  ingress {
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # 모든 아웃바운드 트래픽 허용
   egress {
     from_port   = 0
     to_port     = 0
@@ -88,7 +109,7 @@ resource "aws_security_group" "atlantis_sg" {
   }
 }
 
-# 인라인 설치 스크립트가 포함된 EC2 인스턴스
+# EC2 인스턴스 리소스
 resource "aws_instance" "atlantis_instance" {
   ami                    = var.ami_id
   instance_type          = var.instance_type
@@ -96,153 +117,69 @@ resource "aws_instance" "atlantis_instance" {
   subnet_id              = aws_subnet.atlantis_subnet.id
   vpc_security_group_ids = [aws_security_group.atlantis_sg.id]
 
-  user_data = <<-EOF
+  user_data = base64encode(<<-EOF
     #!/bin/bash
+    set -e
 
-    # 시스템 로그 파일 설정
+    # 로깅 설정
     exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-    echo "시작: $(date)"
 
-    # 1. 패키지 업데이트 및 필요한 도구 설치
+    # 기본 패키지 업데이트 및 설치
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
+    apt-get upgrade -y
     apt-get install -y docker.io snapd curl git jq
-    
-    # 2. Docker 설정
-    systemctl start docker
+
+    # Docker 설정
     systemctl enable docker
+    systemctl start docker
     usermod -aG docker ubuntu
 
-    # 3. Kubernetes 도구 설치 (microk8s)
+    # Kubernetes (MicroK8s) 설치
     snap install microk8s --classic --channel=1.28/stable
     usermod -aG microk8s ubuntu
-    mkdir -p /home/ubuntu/.kube
 
-    # 4. 권한 적용을 위해 새 그룹 세션 시작
-    echo "microk8s 그룹 설정..."
-    sudo -u ubuntu bash -c 'mkdir -p ~/.kube'
-
-    # 5. microk8s 준비 대기
-    echo "microk8s가 준비될 때까지 대기 중..."
+    # MicroK8s 초기 설정
     microk8s status --wait-ready
+    microk8s enable dns helm3 storage
 
-    # 6. 필요한 add-on 활성화
-    echo "microk8s add-on 활성화 중..."
-    microk8s enable dns ingress storage
+    # Helm 리포지토리 설정
+    microk8s helm3 repo add runatlantis https://runatlantis.github.io/helm-charts
+    microk8s helm3 repo update
 
-    # 7. Kubeconfig 설정
-    echo "Kubeconfig 설정 중..."
-    microk8s config > /home/ubuntu/.kube/config
-    chown ubuntu:ubuntu /home/ubuntu/.kube/config
-    chmod 600 /home/ubuntu/.kube/config
-
-    # 8. 환경 변수 설정
-    echo 'export KUBECONFIG=~/.kube/config' >> /home/ubuntu/.bashrc
-    echo 'alias kubectl="microk8s kubectl"' >> /home/ubuntu/.bashrc
-
-    # 9. kubectl 설치
-    echo "kubectl 설치 중..."
-    snap install kubectl --classic
-
-    # 10. helm 설치
-    echo "Helm 설치 중..."
-    curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-    chmod +x get_helm.sh
-    ./get_helm.sh
-
-    # 11. 퍼블릭 DNS 및 IP 가져오기
-    PUBLIC_DNS=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
-    PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
-
-    echo "퍼블릭 DNS: $PUBLIC_DNS"
-    echo "퍼블릭 IP: $PUBLIC_IP"
-
-    # 12. Atlantis 값 파일 생성
-    echo "Atlantis 설정 파일 생성 중..."
+    # Atlantis 설정 파일 생성
     cat > /home/ubuntu/atlantis-values.yaml << VALUESEOF
-    atlantis:
-        service:
-        type: NodePort
-        ingress:
-        enabled: true
-        hosts:
-            - host: "$PUBLIC_DNS"
-            paths: ["/"]
-            - host: "$PUBLIC_IP"
-            paths: ["/"]
-        github:
-        user: "${var.github_username}"
-        token: "${var.github_token}"
-        secret: "${var.webhook_secret}"
-        allowForkPRs: true
-        repoConfig: |
-        repos:
-        - id: /.*/
-            branch: /.*/
-            workflow: default
-            apply_requirements: [approved, mergeable]
-        resources:
-        requests:
-            memory: "256Mi"
-            cpu: "200m"
-        limits:
-            memory: "512Mi"
-            cpu: "500m"
+    service:
+      type: NodePort
+    ingress:
+      enabled: false
+    github:
+      user: "${var.github_username}"
+      token: "${var.github_token}"
+      secret: "${var.webhook_secret}"
+    repoConfig: |
+      repos:
+      - id: /.*/
+        workflow: default
     VALUESEOF
 
-    chown ubuntu:ubuntu /home/ubuntu/atlantis-values.yaml
+    # Atlantis 배포
+    microk8s helm3 install atlantis runatlantis/atlantis -f /home/ubuntu/atlantis-values.yaml
 
-    # 13. Helm 리포지토리 추가
-    echo "Helm 리포지토리 추가 중..."
-    sudo -u ubuntu bash -c "microk8s helm3 repo add runatlantis https://runatlantis.github.io/helm-charts"
-    sudo -u ubuntu bash -c "microk8s helm3 repo update"
-
-    # 14. Atlantis 배포
-    echo "Atlantis 배포 중..."
-    sudo -u ubuntu bash -c "microk8s helm3 install atlantis runatlantis/atlantis -f /home/ubuntu/atlantis-values.yaml"
-
-    # 15. 배포 완료 대기
-    echo "배포 완료 대기 중..."
-    sleep 30
-
-    # 16. NodePort를 80 포트로 포워딩 설정
-    echo "포트 포워딩 설정 중..."
+    # 포트 포워딩 설정
     NODEPORT=$(microk8s kubectl get svc atlantis -o jsonpath='{.spec.ports[0].nodePort}')
     iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port $NODEPORT
-    
-    # 재부팅 후에도 iptables 규칙이 유지되도록 부팅 스크립트 생성
-    cat > /etc/rc.local << 'RCLOCAL'
-    #!/bin/bash
-    NODEPORT=$(microk8s kubectl get svc atlantis -o jsonpath='{.spec.ports[0].nodePort}')
-    iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port $NODEPORT
-    exit 0
-    RCLOCAL
-    
-    chmod +x /etc/rc.local
 
-    # 18. 완료 메시지
-    echo "설치 완료!"
-    echo "Atlantis는 다음 주소에서 접근할 수 있습니다:"
-    echo "http://$PUBLIC_DNS"
-    echo "또는"
-    echo "http://$PUBLIC_IP"
+    # 웹훅 URL 파일 생성
+    PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+    echo "GitHub Webhook URL: http://$PUBLIC_IP/events" > /home/ubuntu/webhook-url.txt
 
-    # 19. 설치 완료 메시지 파일 생성
-    cat > /home/ubuntu/setup-complete.txt << COMPLETEEOF
-    Atlantis 설치가 완료되었습니다.
-    접근 URL:
-    http://$PUBLIC_DNS
-    http://$PUBLIC_IP
-
-    GitHub Webhook URL: http://$PUBLIC_DNS/events 또는 http://$PUBLIC_IP/events
-    Content Type: application/json
-    Secret: <WEBHOOK_SECRET 값>
-    이벤트: Pull requests, pushes
-    COMPLETEEOF
-
-    chown ubuntu:ubuntu /home/ubuntu/setup-complete.txt
-    echo "종료: $(date)"
+    # 최종 로그
+    echo "Atlantis 설치 완료: $(date)"
     EOF
+  )
+
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_size = 20
@@ -254,7 +191,7 @@ resource "aws_instance" "atlantis_instance" {
   }
 }
 
-# 변수 정의
+# 변수 정의 (이전 코드와 동일)
 variable "region" {
   description = "AWS 리전"
   default     = "ap-northeast-2"
@@ -307,4 +244,8 @@ output "ssh_command" {
 
 output "atlantis_url" {
   value = "http://${aws_instance.atlantis_instance.public_ip}"
+}
+
+output "webhook_url_file" {
+  value = "/home/ubuntu/webhook-url.txt"
 }
